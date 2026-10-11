@@ -16,7 +16,12 @@ pub trait Volume {
     fn stat(&mut self, path: &str) -> Result<Entry, Error>;
 
     /// Enumerate ordinary children; dot entries are namespace traversal, not children.
-    fn entry(&mut self, path: &str, index: usize) -> Result<Option<Entry>, Error>;
+    fn read_directory(
+        &mut self,
+        path: &str,
+        cursor: protocol::DirectoryCursor,
+        output: &mut [u8],
+    ) -> Result<usize, Error>;
 
     fn read(&mut self, path: &str, offset: u64, output: &mut [u8]) -> Result<usize, Error>;
 
@@ -182,16 +187,25 @@ fn dispatch(
             entry = volume.stat(request.path)?;
             Ok(0)
         }
-        Operation::Entry => match volume.entry(
-            request.path,
-            usize::try_from(request.offset).map_err(|_| Error::InvalidInput)?,
-        )? {
-            Some(value) => {
-                entry = value;
-                Ok(1)
+        Operation::ReadDirectory => {
+            let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
+            if request.offset != 0
+                || !request.target.is_empty()
+                || request.accessed.is_some()
+                || request.modified.is_some()
+                || !(protocol::DIRECTORY_MIN_BYTES..=protocol::DIRECTORY_BATCH_BYTES)
+                    .contains(&length)
+            {
+                return Err(Error::InvalidInput);
             }
-            None => Ok(0),
-        },
+            volume
+                .read_directory(
+                    request.path,
+                    request.cursor,
+                    data.get_mut(..length).ok_or(Error::InvalidInput)?,
+                )
+                .map(|n| n as u64)
+        }
         Operation::Read => {
             let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
             volume
