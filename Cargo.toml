@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+[package]
+workspace = "../../app"
+name = "hyper-fs-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+[dependencies]
+hyper-os = { workspace = true, features = ["std"] }
+hyper-service.workspace = true
+hyper-filesystem.workspace = true
+[lints]
+workspace = true
