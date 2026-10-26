@@ -136,6 +136,7 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
     } = state;
     let mut bytes = vec![0; protocol::REQUEST_BYTES];
     let mut reply = [0; protocol::RESPONSE_BYTES];
+    let trace = hyper_os::channel::RpcTracer::new(server.as_handle_ref());
     loop {
         let observed = wait::wait_many(
             &[
@@ -193,10 +194,20 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
             return Err("filesystem sequence mismatch".into());
         }
         sequence = request.sequence;
+        let context = trace.server_begin(sequence, request.operation as u64, None);
         // SAFETY: The received request transfers exclusive ownership of this
         // shared byte range. Kernel waits for the reply before accessing it.
         let result = dispatch(volume, request, unsafe { buffer.bytes_mut() }, &mut reply)?;
-        server.as_byte_channel().send(&reply).map_err(show)?;
+        let sent = server.as_byte_channel().send(&reply);
+        trace.server_end(
+            context,
+            if sent.is_err() {
+                u64::MAX
+            } else {
+                result.map_or(0, |error| error as u64)
+            },
+        );
+        sent.map_err(show)?;
         if result.is_some_and(Error::terminal) {
             return Err("filesystem backend failed".into());
         }
