@@ -7,7 +7,8 @@
 
 use hyper_filesystem::protocol::{self, Entry, Error, Operation, Request, Response};
 use hyper_os::{
-    handle::ByteChannelObject,
+    block::BlockQueue,
+    handle::{BlockQueueObject, ByteChannelObject, HandleRef},
     startup::Startup,
     wait::{self, ObjectSignals, WaitItem},
 };
@@ -25,11 +26,31 @@ pub trait Volume {
 
     fn read(&mut self, path: &str, offset: u64, output: &mut [u8]) -> Result<usize, Error>;
 
+    fn read_extents(
+        &mut self,
+        _path: &str,
+        _offset: u64,
+        _length: usize,
+        _output: &mut [u8],
+    ) -> Result<usize, Error> {
+        Err(Error::Unsupported)
+    }
+
     fn readlink(&mut self, _path: &str, _output: &mut [u8]) -> Result<usize, Error> {
         Err(Error::Unsupported)
     }
 
     fn write(&mut self, path: &str, offset: u64, input: &[u8]) -> Result<usize, Error>;
+
+    fn write_window(
+        &mut self,
+        path: &str,
+        offset: u64,
+        input: &[u8],
+        _token: u64,
+    ) -> Result<usize, Error> {
+        self.write(path, offset, input)
+    }
 
     fn create(&mut self, path: &str, directory: bool) -> Result<(), Error>;
 
@@ -63,13 +84,60 @@ pub struct Transport {
     owner: hyper_os::handle::OwnedHandle<ByteChannelObject>,
     server: hyper_os::handle::OwnedHandle<ByteChannelObject>,
     buffer: hyper_os::filesystem::SharedBuffer,
+    payload: PayloadTransport,
     sequence: u64,
+}
+
+/// Blockless providers never receive a storage capability or window token.
+/// A block-backed worker keeps the exact queue identity through handoff.
+enum PayloadTransport {
+    Buffered,
+    Block {
+        window: hyper_os::filesystem::ReadonlyBuffer,
+        queue: BlockQueue,
+    },
+}
+
+impl Transport {
+    pub fn queue(&self) -> Option<HandleRef<'_, BlockQueueObject>> {
+        match &self.payload {
+            PayloadTransport::Buffered => None,
+            PayloadTransport::Block { queue, .. } => Some(queue.as_handle_ref()),
+        }
+    }
 }
 
 /// Offer the transport to the manager, then serve only ordered kernel requests.
 /// Success requires an explicit stop command; parent or transport death is an
 /// error and never permits reusing a possibly unfinished block transaction.
-pub fn serve(startup: &mut Startup<'_>, volume: &mut impl Volume) -> Result<WorkerReturn, String> {
+pub fn serve(
+    startup: &mut Startup<'_>,
+    volume: &mut impl Volume,
+    queue: BlockQueue,
+) -> Result<WorkerReturn, String> {
+    let window = hyper_os::filesystem::SharedBuffer::from_readonly_memory(
+        startup.borrow(hyper_os::startup::ROOT_VMAR).map_err(show)?,
+        queue.create_window().map_err(show)?,
+        protocol::DATA_BYTES,
+    )
+    .map_err(show)?;
+    serve_payload(startup, volume, PayloadTransport::Block { window, queue })
+}
+
+/// Serve an in-memory or generated filesystem without granting block authority.
+/// Payloads use the ordered shared buffer and no window token is accepted.
+pub fn serve_buffered(
+    startup: &mut Startup<'_>,
+    volume: &mut impl Volume,
+) -> Result<WorkerReturn, String> {
+    serve_payload(startup, volume, PayloadTransport::Buffered)
+}
+
+fn serve_payload(
+    startup: &mut Startup<'_>,
+    volume: &mut impl Volume,
+    payload: PayloadTransport,
+) -> Result<WorkerReturn, String> {
     use hyper_os::{
         capability_channel::{CapabilityChannel, CapabilityDisposition},
         handle::RightsOffer,
@@ -93,7 +161,7 @@ pub fn serve(startup: &mut Startup<'_>, volume: &mut impl Volume) -> Result<Work
     .map_err(show)?;
     let mut client = Some(client);
     {
-        let mut dispositions = [
+        let mut dispositions = vec![
             CapabilityDisposition::move_handle(
                 &mut client,
                 RightsOffer::Exact(filesystem::TRANSPORT_RIGHTS),
@@ -105,6 +173,15 @@ pub fn serve(startup: &mut Startup<'_>, volume: &mut impl Volume) -> Result<Work
             )
             .map_err(show)?,
         ];
+        if let PayloadTransport::Block { queue, .. } = &payload {
+            dispositions.push(
+                CapabilityDisposition::duplicate(
+                    queue.as_handle_ref(),
+                    RightsOffer::Exact(filesystem::QUEUE_RIGHTS),
+                )
+                .map_err(show)?,
+            );
+        }
         hyper_service::io::send_capabilities(
             &control,
             filesystem::WORKER_READY,
@@ -119,6 +196,7 @@ pub fn serve(startup: &mut Startup<'_>, volume: &mut impl Volume) -> Result<Work
             owner,
             server,
             buffer,
+            payload,
             sequence: 0,
         },
         volume,
@@ -132,6 +210,7 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
         owner,
         server,
         mut buffer,
+        payload,
         mut sequence,
     } = state;
     let mut bytes = vec![0; protocol::REQUEST_BYTES];
@@ -172,6 +251,7 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
                     owner,
                     server,
                     buffer,
+                    payload,
                     sequence,
                 }));
             }
@@ -197,7 +277,20 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
         let context = trace.server_begin(sequence, request.operation as u64, None);
         // SAFETY: The received request transfers exclusive ownership of this
         // shared byte range. Kernel waits for the reply before accessing it.
-        let result = dispatch(volume, request, unsafe { buffer.bytes_mut() }, &mut reply)?;
+        let result = dispatch(
+            volume,
+            request,
+            unsafe { buffer.bytes_mut() },
+            match &payload {
+                PayloadTransport::Buffered => None,
+                PayloadTransport::Block { window, .. } => {
+                    // SAFETY: The ordered request owns this window until its
+                    // reply. No slice escapes dispatch or survives the reply.
+                    Some(unsafe { window.bytes() })
+                }
+            },
+            &mut reply,
+        )?;
         let sent = server.as_byte_channel().send(&reply);
         trace.server_end(
             context,
@@ -237,7 +330,11 @@ pub fn return_block(
             .map_err(show)
         }
         WorkerReturn::Handoff(state) => {
+            let PayloadTransport::Block { window, queue } = state.payload else {
+                return Err("block handoff requires a block-backed transport".into());
+            };
             let mut server = Some(state.server);
+            let mut queue = Some(queue.into_handle());
             let mut offers = [
                 CapabilityDisposition::move_handle(
                     &mut block,
@@ -254,6 +351,11 @@ pub fn return_block(
                     RightsOffer::Exact(hyper_service::filesystem::SERVER_BUFFER_RIGHTS),
                 )
                 .map_err(show)?,
+                CapabilityDisposition::move_handle(
+                    &mut queue,
+                    RightsOffer::Exact(hyper_service::filesystem::QUEUE_RIGHTS),
+                )
+                .map_err(show)?,
             ];
             let mut record = [0; 16];
             record[..8].copy_from_slice(hyper_service::filesystem::WORKER_STATE);
@@ -266,6 +368,7 @@ pub fn return_block(
             )
             .map_err(show)?;
             drop(state.buffer);
+            drop(window);
             drop(state.owner);
             drop(state.control);
             // Only system init decides when the old process retires. The
@@ -308,13 +411,14 @@ pub fn adopt(
         CapabilityReceiveSlot::new::<NativeBlockObject>(hyper_os::block::RIGHTS),
         CapabilityReceiveSlot::new::<ByteChannelObject>(filesystem::TRANSPORT_RIGHTS),
         CapabilityReceiveSlot::new::<VmoObject>(filesystem::SERVER_BUFFER_RIGHTS),
+        CapabilityReceiveSlot::new::<BlockQueueObject>(filesystem::QUEUE_RIGHTS),
     ];
     let message = control
         .receive(hyper_os::DEADLINE_INFINITE, &mut bytes, &mut slots)
         .map_err(show)?;
     if message.bytes().len() != 16
         || &message.bytes()[..8] != filesystem::WORKER_STATE
-        || message.capability_count() != 3
+        || message.capability_count() != 4
     {
         return Err("invalid filesystem adoption record".into());
     }
@@ -331,6 +435,18 @@ pub fn adopt(
         .take::<VmoObject>()
         .map_err(show)?
         .ok_or("missing adopted shared memory")?;
+    let queue = BlockQueue::from_handle(
+        slots[3]
+            .take::<BlockQueueObject>()
+            .map_err(show)?
+            .ok_or("missing adopted block queue")?,
+    );
+    let window = hyper_os::filesystem::SharedBuffer::from_readonly_memory(
+        startup.borrow(hyper_os::startup::ROOT_VMAR).map_err(show)?,
+        queue.create_window().map_err(show)?,
+        protocol::DATA_BYTES,
+    )
+    .map_err(show)?;
     let buffer = hyper_os::filesystem::SharedBuffer::from_memory(
         startup.borrow(hyper_os::startup::ROOT_VMAR).map_err(show)?,
         memory,
@@ -344,6 +460,7 @@ pub fn adopt(
             owner,
             server,
             buffer,
+            payload: PayloadTransport::Block { window, queue },
             sequence,
         },
     ))
@@ -364,6 +481,7 @@ fn dispatch(
     volume: &mut impl Volume,
     request: Request<'_>,
     data: &mut [u8],
+    window: Option<&[u8]>,
     reply: &mut [u8; protocol::RESPONSE_BYTES],
 ) -> Result<Option<Error>, String> {
     let mut entry = Entry::empty();
@@ -401,6 +519,15 @@ fn dispatch(
                 )
                 .map(|n| n as u64)
         }
+        Operation::ReadExtents => {
+            let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
+            if length > protocol::DATA_BYTES || !request.target.is_empty() {
+                return Err(Error::InvalidInput);
+            }
+            volume
+                .read_extents(request.path, request.offset, length, data)
+                .map(|n| n as u64)
+        }
         Operation::ReadLink => {
             let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
             volume
@@ -412,13 +539,21 @@ fn dispatch(
         }
         Operation::Write => {
             let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
-            volume
-                .write(
+            match (window, request.window_token) {
+                (None, 0) => volume.write(
                     request.path,
                     request.offset,
                     data.get(..length).ok_or(Error::InvalidInput)?,
-                )
-                .map(|n| n as u64)
+                ),
+                (Some(window), token) if token != 0 => volume.write_window(
+                    request.path,
+                    request.offset,
+                    window.get(..length).ok_or(Error::InvalidInput)?,
+                    token,
+                ),
+                _ => Err(Error::InvalidInput),
+            }
+            .map(|n| n as u64)
         }
         Operation::Create if request.length <= 1 => {
             volume.create(request.path, request.length != 0).map(|_| 0)
