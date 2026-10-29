@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 roolrz
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# fs-service
+# lib-fs-service
 
 A HypeR component. See [HypeR](https://github.com/HypeR-Proj/HypeR) for
 workspace setup and the installed SDK build boundary.
@@ -13,8 +13,8 @@ workspace setup and the installed SDK build boundary.
 Use the [HypeR workspace](https://github.com/HypeR-Proj/HypeR) to resolve dependencies:
 
 ```sh
-./HypeR/hyper test fs-service
+python3 project.py test lib-fs-service
 ```
 
-Build paths in detailed documentation refer to the generated `out/system` directory.
+Paths in the documentation are relative to the repo-managed workspace root.
 Edit this repository and prepare the workspace again before building.

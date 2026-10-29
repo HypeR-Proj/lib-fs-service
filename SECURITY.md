@@ -36,7 +36,7 @@ Do not report an undisclosed vulnerability in a public issue, pull request,
 discussion, or commit.
 
 Use GitHub's
-[private vulnerability reporting](https://github.com/HypeR-Proj/fs-service/security/advisories/new)
+[private vulnerability reporting](https://github.com/HypeR-Proj/lib-fs-service/security/advisories/new)
 to send the report to the repository maintainers. Private vulnerability
 reporting must be enabled in the repository settings before the repository is
 made public.

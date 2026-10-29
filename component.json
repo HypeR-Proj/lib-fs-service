@@ -1,19 +1,12 @@
 {
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
   "version": 1,
-  "name": "fs-service",
+  "name": "lib-fs-service",
   "kind": "library",
   "origin": {
     "repository": "https://github.com/roolrz/HypeR",
     "commit": "8d42d047058a2b58a291803700e86487fb723f7a"
-  },
-  "sources": {
-    "Cargo.toml": "lib/fs-service/Cargo.toml",
-    "src/lib.rs": "lib/fs-service/src/lib.rs"
-  },
-  "SPDX-FileCopyrightText": "2026 roolrz",
-  "SPDX-License-Identifier": "Apache-2.0",
-  "mounts": {
-    "": "lib/fs-service"
   },
   "packages": [
     "hyper-fs-service"
@@ -24,28 +17,5 @@
       "app-test",
       "APP_TEST_PACKAGE=hyper-fs-service"
     ]
-  ],
-  "cargo_context": {
-    "Cargo.toml": {
-      "workspace": null,
-      "membership": "../../app",
-      "dependency_paths": {
-        "/dependencies/hyper-service": "lib/service"
-      },
-      "inherited_dependencies": {
-        "/dependencies/hyper-os": {
-          "workspace": true,
-          "features": [
-            "std"
-          ]
-        },
-        "/dependencies/hyper-service": {
-          "workspace": true
-        },
-        "/dependencies/hyper-filesystem": {
-          "workspace": true
-        }
-      }
-    }
-  }
+  ]
 }
