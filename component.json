@@ -24,5 +24,28 @@
       "app-test",
       "APP_TEST_PACKAGE=hyper-fs-service"
     ]
-  ]
+  ],
+  "cargo_context": {
+    "Cargo.toml": {
+      "workspace": null,
+      "membership": "../../app",
+      "dependency_paths": {
+        "/dependencies/hyper-service": "lib/service"
+      },
+      "inherited_dependencies": {
+        "/dependencies/hyper-os": {
+          "workspace": true,
+          "features": [
+            "std"
+          ]
+        },
+        "/dependencies/hyper-service": {
+          "workspace": true
+        },
+        "/dependencies/hyper-filesystem": {
+          "workspace": true
+        }
+      }
+    }
+  }
 }
