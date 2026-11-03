@@ -40,8 +40,14 @@ pub trait Volume {
         Err(Error::Unsupported)
     }
 
+    /// Return the accepted input prefix, which may be shorter than input.
+    /// Preserve known progress when a later operation fails; a storage failure
+    /// must remain observable through subsequent operations or sync. Success
+    /// does not promise durability. An error is not a rollback guarantee.
     fn write(&mut self, path: &str, offset: u64, input: &[u8]) -> Result<usize, Error>;
 
+    /// Same progress contract as write; retire every accepted block request
+    /// before returning, including after an error, so the input can be reused.
     fn write_window(
         &mut self,
         path: &str,
