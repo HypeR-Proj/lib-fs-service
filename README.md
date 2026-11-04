@@ -24,12 +24,18 @@ failure into a guaranteed zero-byte write.
 completes the backend sync before its reply, including cleanup after a partial
 failure. Known write progress is still an accepted prefix, not proof of durability;
 a late fence error is latched and subsequent requests/sync report failure.
-`Periodic(Duration)` is reserved for backends with their own recoverable dirty
-cache and background writer. A deadline in the same request owner handles both
-idle and continuously busy mounts without concurrent access to the backend.
-`periodic_sync` defaults to `sync`; a backend can override it to skip clean work
-using its own complete dirty-state accounting. Explicit sync is unaffected.
-`ReadOnly` rejects mutations before dispatch; `Volatile` makes no media promise.
+`Periodic(Duration)` is reserved for recoverable backends. Before negotiation,
+the ordered request loop performs idle/busy periodic sync; `periodic_sync` may
+skip clean work. A backend may implement `enable_vfs_writeback` to accept the
+`TakeWriteback` mount request. It must retire bounded data staging before write
+replies. The reply supplies the interval and disables the service timer: VFS now
+owns dirty file pages, pressure submission, and data-before-checkpoint ordering.
+Explicit sync still executes the backend's full synchronization protocol.
+
+The 24-byte worker handoff record contains the eight-byte marker, sequence and
+VFS-writeback owner flag (u64, 0 or 1). The successor restores that owner before
+servicing requests; bootstrap media export zero. `ReadOnly` rejects mutations
+before dispatch and `Volatile` makes no media promise.
 
 Periodic success includes the backend's device-reported completion, not physical
 readback verification. The interval is a scheduling cadence, not a hard maximum

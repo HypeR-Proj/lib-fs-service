@@ -21,6 +21,12 @@ pub trait Volume {
         WritebackPolicy::Synchronous
     }
 
+    /// Opt in only when writes retire bounded data-page staging before reply.
+    /// Metadata/checkpoint ownership remains in the backend; VFS owns cadence.
+    fn enable_vfs_writeback(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
     fn stat(&mut self, path: &str) -> Result<Entry, Error>;
 
     /// Enumerate ordinary children; dot entries are namespace traversal, not children.
@@ -105,6 +111,7 @@ pub struct Transport {
     buffer: hyper_os::filesystem::SharedBuffer,
     payload: PayloadTransport,
     sequence: u64,
+    vfs_writeback: bool,
 }
 
 /// Blockless providers never receive a storage capability or window token.
@@ -219,6 +226,7 @@ fn serve_payload(
             buffer,
             payload,
             sequence: 0,
+            vfs_writeback: false,
         },
         volume,
     )
@@ -233,11 +241,18 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
         mut buffer,
         payload,
         mut sequence,
+        mut vfs_writeback,
     } = state;
     let mut bytes = vec![0; protocol::REQUEST_BYTES];
     let mut reply = [0; protocol::RESPONSE_BYTES];
     let trace = hyper_os::channel::RpcTracer::new(server.as_handle_ref());
     let mut writeback = writeback::State::new(volume.writeback_policy(), now()?).map_err(show)?;
+    if vfs_writeback {
+        volume.enable_vfs_writeback().map_err(show)?;
+        if writeback.take_writeback().map_err(show)? == 0 {
+            return Err("adopted backend lost VFS writeback support".into());
+        }
+    }
     loop {
         if writeback.deadline() != hyper_os::DEADLINE_INFINITE {
             let current = now()?;
@@ -288,6 +303,7 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
                     buffer,
                     payload,
                     sequence,
+                    vfs_writeback,
                 }));
             }
             if &command[..count] != filesystem::WORKER_STOP {
@@ -327,6 +343,9 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
             },
             &mut reply,
         )?;
+        if request.operation == Operation::TakeWriteback && result.is_none() {
+            vfs_writeback = matches!(volume.writeback_policy(), WritebackPolicy::Periodic(_));
+        }
         let sent = server.as_byte_channel().send(&reply);
         trace.server_end(
             context,
@@ -393,9 +412,10 @@ pub fn return_block(
                 )
                 .map_err(show)?,
             ];
-            let mut record = [0; 16];
+            let mut record = [0; 24];
             record[..8].copy_from_slice(hyper_service::filesystem::WORKER_STATE);
-            record[8..].copy_from_slice(&state.sequence.to_le_bytes());
+            record[8..16].copy_from_slice(&state.sequence.to_le_bytes());
+            record[16..24].copy_from_slice(&u64::from(state.vfs_writeback).to_le_bytes());
             hyper_service::io::send_capabilities(
                 &state.control,
                 &record,
@@ -442,7 +462,7 @@ pub fn adopt(
         hyper_os::DEADLINE_INFINITE,
     )
     .map_err(show)?;
-    let mut bytes = [core::mem::MaybeUninit::uninit(); 16];
+    let mut bytes = [core::mem::MaybeUninit::uninit(); 24];
     let mut slots = [
         CapabilityReceiveSlot::new::<NativeBlockObject>(hyper_os::block::RIGHTS),
         CapabilityReceiveSlot::new::<ByteChannelObject>(filesystem::TRANSPORT_RIGHTS),
@@ -452,13 +472,19 @@ pub fn adopt(
     let message = control
         .receive(hyper_os::DEADLINE_INFINITE, &mut bytes, &mut slots)
         .map_err(show)?;
-    if message.bytes().len() != 16
+    if message.bytes().len() != 24
         || &message.bytes()[..8] != filesystem::WORKER_STATE
         || message.capability_count() != 4
     {
         return Err("invalid filesystem adoption record".into());
     }
-    let sequence = u64::from_le_bytes(message.bytes()[8..].try_into().map_err(show)?);
+    let sequence = u64::from_le_bytes(message.bytes()[8..16].try_into().map_err(show)?);
+    let vfs_writeback = match u64::from_le_bytes(message.bytes()[16..24].try_into().map_err(show)?)
+    {
+        0 => false,
+        1 => true,
+        _ => return Err("invalid filesystem writeback owner".into()),
+    };
     let block = slots[0]
         .take::<NativeBlockObject>()
         .map_err(show)?
@@ -498,6 +524,7 @@ pub fn adopt(
             buffer,
             payload: PayloadTransport::Block { window, queue },
             sequence,
+            vfs_writeback,
         },
     ))
 }
@@ -607,6 +634,21 @@ fn dispatch(
             Operation::Remove => volume.remove(request.path).map(|_| 0),
             Operation::Rename => volume.rename(request.path, request.target).map(|_| 0),
             Operation::Resize => volume.resize(request.path, request.length).map(|_| 0),
+            Operation::TakeWriteback => {
+                if !request.path.is_empty()
+                    || !request.target.is_empty()
+                    || request.offset != 0
+                    || request.length != 0
+                    || request.accessed.is_some()
+                    || request.modified.is_some()
+                {
+                    return Err(Error::InvalidInput);
+                }
+                if matches!(volume.writeback_policy(), WritebackPolicy::Periodic(_)) {
+                    volume.enable_vfs_writeback()?;
+                }
+                writeback.take_writeback()
+            }
             Operation::Sync => volume.sync().map(|_| 0),
             Operation::SetMetadata => volume
                 .set_times(request.path, request.accessed, request.modified)

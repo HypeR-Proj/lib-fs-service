@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Native filesystem services
 
 The kernel owns namespace traversal, capability checks, file identities,
-`flock`, content revisions and the clean page cache. Media parsers run in Native
+`flock`, content revisions and the shared clean/dirty file page cache. Media parsers run in Native
 processes. The block-backed implementations are FAT32 and read-only core EROFS;
 the protocol and worker lifecycle are independent of either format. Ramfs remains
 in the kernel.
@@ -67,7 +67,7 @@ while waiting for the initial mount result.
 Bootstrap and formal format workers have independent source owners and
 executables. Bootstrap workers live in the boot archive; replacement providers
 live in `/svc`. Worker placement remains independent of format detection
-and mount phase: system init requests the default FAT data mount from its own
+and mount phase: system init requests the default F2FS data mount from its own
 fstab after adoption.
 `fs-fat` implements writable FAT32. `fs-erofs` implements read-only,
 uncompressed core EROFS, including compact/extended inodes, plain and inline
@@ -256,7 +256,8 @@ merges adjacent compatible ranges, consumes independently completed commands
 and refills available transport slots. The adapter collects all accepted writes
 before replying to a filesystem request and drains its queue before handoff.
 See [asynchronous block I/O](https://hyper-proj.github.io/lib-block/docs/block-io.html) for admission, DMA lifetime, ordering
-and failure semantics; this does not add asynchronous dirty file-cache writeback.
+and failure semantics. FAT retains synchronous mutation fences and does not
+negotiate dirty file-cache writeback.
 
 The worker waits for both requests and parent-channel closure. Parent death
 closes the worker service after any already executing bounded block operation
@@ -304,6 +305,30 @@ last handle leaves its identity available while cached pages survive; reopening
 from the same or another process can hit them. After all live and cached owners
 disappear, a new open receives a fresh incarnation. Quota and pressure reclaim
 release pages and expired registry records without making filesystem IPC calls.
+
+
+Recoverable backends can negotiate `TakeWriteback` (operation 13) at mount.
+A zero reply preserves synchronous writes; a nonzero reply supplies a bounded
+1–3600 second interval in nanoseconds and transfers periodic sync ownership to
+VFS. The service opts in only if it can retire bounded data staging before
+acknowledging writeback batches. F2FS supports this; FAT and read-only media do
+not. The kernel does not infer capability from a filesystem name.
+
+Buffered writes use the same file pages and content gate as reads. A write
+publishes a new immutable page version; existing reader pins retain the old
+version, while later reads hit the accepted dirty version without an RPC.
+Dirty owners retain the file record and canonical cache key through last close,
+and cannot be discarded by memory reclaim. Each mount admits at most 2,048
+pending pages within the global cache budget. Pressure drains earlier pages
+before further admission; adjacent ranges coalesce into at most 512 KiB requests.
+Sparse extension can use direct I/O after draining pending data.
+
+Explicit sync and each fixed periodic deadline drain VFS dirty data before the
+backend checkpoint/fence. The volume gate excludes concurrent publication during
+that pass. Each participating mount has an independent weakly owned worker;
+failed submission remains sticky and cannot turn dirty data into clean cache.
+Namespace mutations and truncation drain pending versions before retiring their
+backing identity. The allocator's clean-page reclaimer never performs this I/O.
 
 Directory enumeration uses a separate `DirectoryStream` capability derived
 from Directory READ authority. Each stream owns a fixed namespace location and

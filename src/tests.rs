@@ -8,8 +8,25 @@ struct Backend {
     mutations: usize,
     fences: usize,
     fail_fence: bool,
+    periodic: bool,
+    vfs_owner: bool,
 }
 impl Volume for Backend {
+    fn writeback_policy(&self) -> WritebackPolicy {
+        if self.periodic {
+            WritebackPolicy::Periodic(std::time::Duration::from_secs(30))
+        } else {
+            WritebackPolicy::Synchronous
+        }
+    }
+    fn enable_vfs_writeback(&mut self) -> Result<(), Error> {
+        if self.fail_fence {
+            return Err(Error::Io);
+        }
+        self.vfs_owner = true;
+        Ok(())
+    }
+
     fn stat(&mut self, _: &str) -> Result<Entry, Error> {
         Ok(Entry::empty())
     }
@@ -75,7 +92,11 @@ fn invoke(
         operation: op,
         offset: 0,
         length: if op == Operation::Write { 4 } else { 0 },
-        path: "file",
+        path: if op == Operation::TakeWriteback {
+            ""
+        } else {
+            "file"
+        },
         target: "",
         accessed: None,
         modified: None,
@@ -137,5 +158,39 @@ fn readonly_admission_never_calls_a_mutator() -> Result<(), String> {
         Err(Error::ReadOnly)
     );
     assert_eq!((backend.mutations, backend.fences), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn ownership_transfer_requires_backend_acceptance_and_preserves_sync_fallback() -> Result<(), String>
+{
+    let mut backend = Backend {
+        periodic: true,
+        fail_fence: true,
+        ..Backend::default()
+    };
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::TakeWriteback)?,
+        Err(Error::Io)
+    );
+    assert!(!backend.vfs_owner);
+    assert_eq!(state.deadline(), 30_000_000_000);
+    backend.fail_fence = false;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::TakeWriteback)?,
+        Ok(30_000_000_000)
+    );
+    assert!(backend.vfs_owner);
+    assert_eq!(state.deadline(), u64::MAX);
+    let mut backend = Backend::default();
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::TakeWriteback)?,
+        Ok(0)
+    );
+    assert!(!backend.vfs_owner);
+    assert_eq!(invoke(&mut backend, &mut state, Operation::Write)?, Ok(4));
+    assert_eq!(backend.fences, 1);
     Ok(())
 }

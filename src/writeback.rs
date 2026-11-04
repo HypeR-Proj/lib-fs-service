@@ -9,7 +9,8 @@ use std::time::Duration;
 pub enum WritebackPolicy {
     /// Each mutation completes filesystem synchronization before replying.
     Synchronous,
-    /// The backend owns recoverable dirty data and its pressure-driven writer.
+    /// Recoverable media with periodic synchronization. The backend owns
+    /// cadence until VFS explicitly takes dirty-data and timer ownership.
     Periodic(Duration),
     /// No persistent medium exists; no durability is advertised.
     Volatile,
@@ -53,6 +54,22 @@ impl State {
             failure: None,
             deadline: interval.map_or(u64::MAX, |n| now.saturating_add(n).min(u64::MAX - 1)),
         })
+    }
+
+    pub(crate) fn take_writeback(&mut self) -> Result<u64, Error> {
+        self.admit(Operation::TakeWriteback)?;
+        let interval = match self.policy {
+            WritebackPolicy::Periodic(duration) => {
+                u64::try_from(duration.as_nanos()).map_err(|_| Error::InvalidInput)?
+            }
+            _ => 0,
+        };
+        if interval != 0 && !(1_000_000_000..=3_600_000_000_000).contains(&interval) {
+            return Err(Error::InvalidInput);
+        }
+        self.interval = None;
+        self.deadline = u64::MAX;
+        Ok(interval)
     }
 
     pub(crate) fn deadline(&self) -> u64 {
@@ -145,6 +162,26 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn negotiated_vfs_owner_disables_only_the_periodic_timer() -> Result<(), Error> {
+        let mut state = State::new(WritebackPolicy::Periodic(Duration::from_secs(30)), 0)?;
+        assert_eq!(state.take_writeback()?, 30_000_000_000);
+        assert_eq!(state.deadline(), u64::MAX);
+        state.periodic(60_000_000_000, || Err(Error::Io))?;
+        state.complete(Operation::Write, Ok(4), || Err(Error::Io))?;
+        assert_eq!(
+            state.complete(Operation::Sync, Err(Error::Io), || Ok(())),
+            Err(Error::Io)
+        );
+        assert_eq!(state.admit(Operation::Write), Err(Error::Io));
+        let mut synchronous = State::new(WritebackPolicy::Synchronous, 0)?;
+        assert_eq!(synchronous.take_writeback()?, 0);
+        assert_eq!(
+            synchronous.complete(Operation::Create, Ok(0), || Err(Error::Io)),
+            Err(Error::Io)
+        );
+        Ok(())
+    }
     #[test]
     fn idle_and_busy_traffic_use_same_fixed_deadline() -> Result<(), Error> {
         let mut state = State::new(WritebackPolicy::Periodic(Duration::from_nanos(30)), 0)?;
