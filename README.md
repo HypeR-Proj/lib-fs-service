@@ -20,6 +20,28 @@ Accepted write progress is distinct from durable completion. Drivers must preser
 partial progress and report their media errors; the transport does not turn a late flush
 failure into a guaranteed zero-byte write.
 
+`Volume::writeback_policy` defaults to `Synchronous`: every mutating request
+completes the backend sync before its reply, including cleanup after a partial
+failure. Known write progress is still an accepted prefix, not proof of durability;
+a late fence error is latched and subsequent requests/sync report failure.
+`Periodic(Duration)` is reserved for recoverable backends. Before negotiation,
+the ordered request loop performs idle/busy periodic sync; `periodic_sync` may
+skip clean work. A backend may implement `enable_vfs_writeback` to accept the
+`TakeWriteback` mount request. It must retire bounded data staging before write
+replies. The reply supplies the interval and disables the service timer: VFS now
+owns dirty file pages, pressure submission, and data-before-checkpoint ordering.
+Explicit sync still executes the backend's full synchronization protocol.
+
+The 24-byte worker handoff record contains the eight-byte marker, sequence and
+VFS-writeback owner flag (u64, 0 or 1). The successor restores that owner before
+servicing requests; bootstrap media export zero. `ReadOnly` rejects mutations
+before dispatch and `Volatile` makes no media promise.
+
+Periodic success includes the backend's device-reported completion, not physical
+readback verification. The interval is a scheduling cadence, not a hard maximum
+persistence latency. Failure never advances the deadline, and stopping or handing
+off the service cannot leave a detached synchronization thread.
+
 ## Build and test
 
 Use this checkout inside the [repo-managed workspace](https://github.com/HypeR-Proj/HypeR).
