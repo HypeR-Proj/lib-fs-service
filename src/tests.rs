@@ -10,8 +10,16 @@ struct Backend {
     fail_fence: bool,
     periodic: bool,
     vfs_owner: bool,
+    read_extents: bool,
 }
 impl Volume for Backend {
+    fn capabilities(&self) -> protocol::Capabilities {
+        if self.read_extents {
+            protocol::Capabilities::READ_EXTENTS
+        } else {
+            protocol::Capabilities::NONE
+        }
+    }
     fn writeback_policy(&self) -> WritebackPolicy {
         if self.periodic {
             WritebackPolicy::Periodic(std::time::Duration::from_secs(30))
@@ -92,7 +100,7 @@ fn invoke(
         operation: op,
         offset: 0,
         length: if op == Operation::Write { 4 } else { 0 },
-        path: if op == Operation::TakeWriteback {
+        path: if matches!(op, Operation::TakeWriteback | Operation::Capabilities) {
             ""
         } else {
             "file"
@@ -106,6 +114,82 @@ fn invoke(
     Ok(protocol::ResponseRef::decode(&reply, 1, op)
         .ok_or("bad reply")?
         .result())
+}
+
+#[test]
+fn capability_query_is_readonly_and_range_rejection_preserves_support() -> Result<(), String> {
+    let mut backend = Backend {
+        periodic: true,
+        ..Backend::default()
+    };
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    let deadline = state.deadline();
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Capabilities)?,
+        Ok(0)
+    );
+    assert!(!backend.vfs_owner);
+    assert_eq!(state.deadline(), deadline);
+    backend.read_extents = true;
+    let advertised = protocol::Capabilities::READ_EXTENTS.bits();
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Capabilities)?,
+        Ok(advertised)
+    );
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::ReadExtents)?,
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Capabilities)?,
+        Ok(advertised)
+    );
+    assert_eq!(backend.mutations, 0);
+    assert_eq!(backend.fences, 0);
+    assert_eq!(state.deadline(), deadline);
+    Ok(())
+}
+
+#[test]
+fn malformed_capability_query_has_no_side_effects() -> Result<(), String> {
+    let mut backend = Backend::default();
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    for field in 0..6 {
+        let request = Request {
+            sequence: 1,
+            operation: Operation::Capabilities,
+            window_token: 0,
+            cursor: protocol::DirectoryCursor::START,
+            path: if field == 0 { "file" } else { "" },
+            target: if field == 1 { "target" } else { "" },
+            offset: u64::from(field == 2),
+            length: u64::from(field == 3),
+            accessed: if field == 4 {
+                hyper_filesystem::Timestamp::new(1, 0)
+            } else {
+                None
+            },
+            modified: if field == 5 {
+                hyper_filesystem::Timestamp::new(1, 0)
+            } else {
+                None
+            },
+        };
+        let mut reply = [0; protocol::RESPONSE_BYTES];
+        dispatch(&mut backend, &mut state, request, &mut [], None, &mut reply)?;
+        let response = protocol::ResponseRef::decode(&reply, 1, Operation::Capabilities)
+            .ok_or("capability error reply")?;
+        assert_eq!(response.result(), Err(Error::InvalidInput));
+        assert!(response.features().supports_capability_query());
+    }
+    assert_eq!(backend.mutations, 0);
+    assert_eq!(backend.fences, 0);
+    assert!(!backend.vfs_owner);
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Capabilities)?,
+        Ok(0)
+    );
+    Ok(())
 }
 
 #[test]

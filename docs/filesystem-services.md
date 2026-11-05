@@ -77,6 +77,33 @@ Its [reader documentation](https://github.com/HypeR-Proj/fs-erofs/blob/main/READ
 supported block sizes. Recognition alone is not a promise that a worker can
 read every extension of that filesystem format.
 
+## Optional filesystem operations
+
+The ordered protocol supports a read-only `Capabilities` request, separate from
+the `TakeWriteback` operation that transfers periodic synchronization ownership.
+Every query payload field is empty. Its result is a 64-bit capability set;
+bit 0 advertises `ReadExtents`. Unknown bits are ignored by clients. The default
+`Volume` implementation advertises no optional operations. FAT and EROFS opt
+into extent reads; F2FS uses ordinary reads through the common VFS cache.
+
+Clients query only after a normal response advertises support for that request.
+The fixed 1152-byte response has a little-endian protocol-feature word at byte
+1144; bit 0 means that the dispatcher understands `Capabilities`. This word is
+outside even a maximum-length entry name. Legacy encoders leave it zero, so new
+clients do not send an unknown operation to a legacy dispatcher, which might
+close its transport. A legacy provider retains the existing extent-read probe
+and ordinary-read fallback behavior. Unknown response-feature bits are ignored.
+
+The kernel caches the query result for the transport lifetime. An advertised
+extent capability permits a per-file or per-range `Unsupported` result without
+clearing that capability; the affected read falls back to the ordinary path.
+An unsupported capability query also retains legacy behavior without repeated
+queries. Capability declarations must remain stable through adoption of the
+same live transport; the bootstrap and formal FAT/EROFS providers advertise the
+same set. A new mounted transport negotiates independently. Neither querying
+capabilities nor publishing the feature word changes synchronization ownership,
+filesystem contents, or write durability.
+
 ## Online provider adoption
 
 The private bootstrap handoff channel is distinct from mount administration.
