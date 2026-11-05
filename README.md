@@ -30,7 +30,13 @@ skip clean work. A backend may implement `enable_vfs_writeback` to accept the
 `TakeWriteback` mount request. It must retire bounded data staging before write
 replies. The reply supplies the interval and disables the service timer: VFS now
 owns dirty file pages, pressure submission, and data-before-checkpoint ordering.
-Explicit sync still executes the backend's full synchronization protocol.
+`Sync` requests the full volume fence. `SyncFile` names one path and encodes
+`SyncMode` in `length` (0 for data and recovery metadata, 1 for all file metadata);
+the other payload fields are empty. `Volume::sync_file` defaults to validating
+the path and calling volume sync. Recoverable backends may override it to use
+file recovery records with checkpoint fallback. Neither operation restarts the
+periodic deadline. File-sync device errors are sticky; malformed scopes and
+missing paths do not poison a healthy mount.
 
 The 24-byte worker handoff record contains the eight-byte marker, sequence and
 VFS-writeback owner flag (u64, 0 or 1). The successor restores that owner before

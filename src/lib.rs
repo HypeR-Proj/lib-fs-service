@@ -81,8 +81,14 @@ pub trait Volume {
 
     fn sync(&mut self) -> Result<(), Error>;
 
+    /// Backends without a file recovery log may provide the stronger volume fence.
+    fn sync_file(&mut self, path: &str, _mode: protocol::SyncMode) -> Result<(), Error> {
+        self.stat(path)?;
+        self.sync()
+    }
+
     /// Backends may skip a periodic checkpoint after inspecting all dirty state.
-    /// Explicit sync and teardown continue to use `sync`.
+    /// Explicit volume sync and teardown continue to use `sync`.
     fn periodic_sync(&mut self) -> Result<(), Error> {
         self.sync()
     }
@@ -650,6 +656,17 @@ fn dispatch(
                 writeback.take_writeback()
             }
             Operation::Sync => volume.sync().map(|_| 0),
+            Operation::SyncFile => {
+                if !request.target.is_empty()
+                    || request.offset != 0
+                    || request.accessed.is_some()
+                    || request.modified.is_some()
+                {
+                    return Err(Error::InvalidInput);
+                }
+                let mode = protocol::SyncMode::decode(request.length).ok_or(Error::InvalidInput)?;
+                volume.sync_file(request.path, mode).map(|_| 0)
+            }
             Operation::SetMetadata => volume
                 .set_times(request.path, request.accessed, request.modified)
                 .map(|_| 0),

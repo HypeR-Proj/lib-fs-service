@@ -194,3 +194,61 @@ fn ownership_transfer_requires_backend_acceptance_and_preserves_sync_fallback() 
     assert_eq!(backend.fences, 1);
     Ok(())
 }
+
+#[test]
+fn file_sync_falls_back_to_one_volume_fence_and_latches_io_failure() -> Result<(), String> {
+    let mut backend = Backend::default();
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::SyncFile)?,
+        Ok(0)
+    );
+    assert_eq!(backend.fences, 1);
+    backend.fail_fence = true;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::SyncFile)?,
+        Err(Error::Io)
+    );
+    backend.fail_fence = false;
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Write)?,
+        Err(Error::Io)
+    );
+    assert_eq!(backend.fences, 2);
+    Ok(())
+}
+
+#[test]
+fn malformed_file_sync_does_not_fence_or_poison_the_mount() -> Result<(), String> {
+    let mut backend = Backend::default();
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    for field in 0..4 {
+        let request = Request {
+            sequence: 1,
+            operation: Operation::SyncFile,
+            window_token: 0,
+            cursor: protocol::DirectoryCursor::default(),
+            path: "file",
+            target: if field == 0 { "other" } else { "" },
+            offset: u64::from(field == 1),
+            length: if field == 2 { 2 } else { 0 },
+            accessed: None,
+            modified: if field == 3 {
+                hyper_filesystem::Timestamp::new(1, 0)
+            } else {
+                None
+            },
+        };
+        let mut reply = [0; protocol::RESPONSE_BYTES];
+        dispatch(&mut backend, &mut state, request, &mut [], None, &mut reply)?;
+        assert_eq!(
+            protocol::ResponseRef::decode(&reply, 1, Operation::SyncFile)
+                .ok_or("bad sync reply")?
+                .result(),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(backend.fences, 0);
+    }
+    assert_eq!(invoke(&mut backend, &mut state, Operation::Write)?, Ok(4));
+    Ok(())
+}

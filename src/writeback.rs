@@ -107,8 +107,9 @@ impl State {
                 };
             }
         }
-        if operation == Operation::Sync
-            && let Err(error) = result
+        if let Err(error) = result
+            && (operation == Operation::Sync
+                || (operation == Operation::SyncFile && error.terminal()))
         {
             self.failure = Some(error);
         }
