@@ -9,7 +9,7 @@ Common Native filesystem worker transport and lifecycle.
 
 Format adapters implement the Volume contract. This library validates requests, owns
 shared request buffers, orders range/metadata operations and coordinates mount
-publication, parent failure and device return.
+publication, parent failure and teardown acknowledgement.
 
 See the [implementation entry](src/lib.rs) and [component declaration](component.json)
 for the public interfaces, build dependencies and delivered artifacts.
@@ -39,7 +39,8 @@ periodic deadline. File-sync device errors are sticky; malformed scopes and
 missing paths do not poison a healthy mount.
 
 The 24-byte worker handoff record contains the eight-byte marker, sequence and
-VFS-writeback owner flag (u64, 0 or 1). The successor restores that owner before
+VFS-writeback owner flag (u64, 0 or 1), with server endpoint, shared buffer and
+block queue capabilities. NativeBlock stays in the manager. The successor restores that owner before
 servicing requests; bootstrap media export zero. `ReadOnly` rejects mutations
 before dispatch and `Volatile` makes no media promise.
 
@@ -63,3 +64,26 @@ entry delegates to build/system, which prepares the installed SDK and declared
 dependencies. Native binaries require HypeR; host module checks cover the tests
 selected by component.json. A standalone clone does not contain the workspace’s
 other source repositories or Native SDK.
+
+## Preparing and publishing a worker
+
+The shared filesystem protocol defines the periodic range as 1 second through
+1 hour. Zero is only the non-periodic negotiation sentinel. Configure and validate
+`WritebackPolicy` before publication; the service captures it once for each
+serving instance. Request handling never re-queries a mutable policy getter.
+The receiver still validates untrusted negotiation replies independently.
+
+`WORKER_READY` is sent after root validation, request-buffer allocation and policy
+preparation. `WORKER_RESUMED` additionally requires successful restoration of VFS
+writeback ownership. Neither means a particular application request was accepted.
+A failed preparation publishes neither success notification. During negotiation,
+validate first, invoke the backend hook, then commit timer ownership. Hook failure
+must retain the prior owner or be terminal; repeated successful negotiation does
+not run the enable hook again.
+
+After `serve` or `resume` returns, the format adapter closes its filesystem and
+retires outstanding media work before calling `finish` to acknowledge teardown.
+The manager independently revokes and drains the queue before reuse. Handoff
+retains the mounted endpoint and sequence. Transport closure, process exit and
+logical request cancellation do not establish physical I/O retirement. See the
+`Volume` trait for terminal errors and borrowed-window lifetime obligations.

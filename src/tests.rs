@@ -11,6 +11,9 @@ struct Backend {
     periodic: bool,
     vfs_owner: bool,
     read_extents: bool,
+    policy: Option<WritebackPolicy>,
+    policy_queries: std::cell::Cell<usize>,
+    enables: usize,
 }
 impl Volume for Backend {
     fn capabilities(&self) -> protocol::Capabilities {
@@ -21,6 +24,10 @@ impl Volume for Backend {
         }
     }
     fn writeback_policy(&self) -> WritebackPolicy {
+        self.policy_queries.set(self.policy_queries.get() + 1);
+        if let Some(policy) = self.policy {
+            return policy;
+        }
         if self.periodic {
             WritebackPolicy::Periodic(std::time::Duration::from_secs(30))
         } else {
@@ -28,6 +35,7 @@ impl Volume for Backend {
         }
     }
     fn enable_vfs_writeback(&mut self) -> Result<(), Error> {
+        self.enables += 1;
         if self.fail_fence {
             return Err(Error::Io);
         }
@@ -88,12 +96,8 @@ impl Volume for Backend {
     }
 }
 
-fn invoke(
-    backend: &mut Backend,
-    state: &mut writeback::State,
-    op: Operation,
-) -> Result<Result<u64, Error>, String> {
-    let request = Request {
+fn request(op: Operation) -> Request<'static> {
+    Request {
         window_token: 0,
         cursor: protocol::DirectoryCursor::default(),
         sequence: 1,
@@ -108,7 +112,15 @@ fn invoke(
         target: "",
         accessed: None,
         modified: None,
-    };
+    }
+}
+
+fn invoke(
+    backend: &mut Backend,
+    state: &mut writeback::State,
+    op: Operation,
+) -> Result<Result<u64, Error>, String> {
+    let request = request(op);
     let mut reply = [0; protocol::RESPONSE_BYTES];
     dispatch(backend, state, request, &mut [1, 2, 3, 4], None, &mut reply)?;
     Ok(protocol::ResponseRef::decode(&reply, 1, op)
@@ -334,5 +346,103 @@ fn malformed_file_sync_does_not_fence_or_poison_the_mount() -> Result<(), String
         assert_eq!(backend.fences, 0);
     }
     assert_eq!(invoke(&mut backend, &mut state, Operation::Write)?, Ok(4));
+    Ok(())
+}
+
+#[test]
+fn preparation_validates_range_and_captures_policy_once() -> Result<(), String> {
+    use std::time::Duration;
+    for duration in [
+        Duration::ZERO,
+        Duration::from_millis(500),
+        Duration::from_secs(3601),
+        Duration::MAX,
+    ] {
+        let mut backend = Backend {
+            policy: Some(WritebackPolicy::Periodic(duration)),
+            ..Backend::default()
+        };
+        let error = PreparedRuntime::new(&mut backend, true, 0)
+            .err()
+            .ok_or("invalid policy accepted")?;
+        assert!(error.contains("periodic interval"));
+        assert_eq!(backend.enables, 0);
+    }
+    for seconds in [1, 3600] {
+        let mut backend = Backend {
+            policy: Some(WritebackPolicy::Periodic(Duration::from_secs(seconds))),
+            ..Backend::default()
+        };
+        let mut runtime = PreparedRuntime::new(&mut backend, false, 0)?;
+        assert_eq!(runtime.bytes.len(), protocol::REQUEST_BYTES);
+        // A backend changing its getter later cannot change the admitted policy.
+        backend.policy = Some(WritebackPolicy::Synchronous);
+        assert_eq!(
+            invoke(
+                &mut backend,
+                &mut runtime.writeback,
+                Operation::TakeWriteback
+            )?,
+            Ok(seconds * 1_000_000_000)
+        );
+        assert_eq!(backend.enables, 1);
+        assert!(runtime.writeback.delegated());
+        assert_eq!(
+            invoke(
+                &mut backend,
+                &mut runtime.writeback,
+                Operation::TakeWriteback
+            )?,
+            Ok(seconds * 1_000_000_000)
+        );
+        assert_eq!(backend.enables, 1);
+        assert_eq!(backend.policy_queries.get(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn resumed_runtime_is_ready_only_after_restored_owner_accepts() -> Result<(), String> {
+    let mut backend = Backend {
+        periodic: true,
+        fail_fence: true,
+        ..Backend::default()
+    };
+    assert!(PreparedRuntime::new(&mut backend, true, 0).is_err());
+    assert!(!backend.vfs_owner);
+    backend.fail_fence = false;
+    let runtime = PreparedRuntime::new(&mut backend, true, 0)?;
+    assert!(backend.vfs_owner);
+    assert!(runtime.writeback.delegated());
+    assert_eq!(runtime.writeback.deadline(), u64::MAX);
+    let mut synchronous = Backend::default();
+    assert!(PreparedRuntime::new(&mut synchronous, true, 0).is_err());
+    assert_eq!(synchronous.enables, 0);
+    Ok(())
+}
+
+#[test]
+fn malformed_negotiation_has_no_backend_side_effects() -> Result<(), String> {
+    let mut backend = Backend {
+        periodic: true,
+        ..Backend::default()
+    };
+    let mut runtime = PreparedRuntime::new(&mut backend, false, 0)?;
+    let mut request = request(Operation::TakeWriteback);
+    request.path = "unexpected";
+    let mut reply = [0; protocol::RESPONSE_BYTES];
+    assert_eq!(
+        dispatch(
+            &mut backend,
+            &mut runtime.writeback,
+            request,
+            &mut [],
+            None,
+            &mut reply
+        )?,
+        Some(Error::InvalidInput)
+    );
+    assert_eq!(backend.enables, 0);
+    assert_eq!(runtime.writeback.deadline(), 30_000_000_000);
     Ok(())
 }
