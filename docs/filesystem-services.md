@@ -119,7 +119,9 @@ explicit lock before being used on a path that serves their own filesystem.
 Each original worker completes its current request, flushes media state and
 stops consuming the request channel. It moves its exclusive `NativeBlock`, the
 same byte-channel server endpoint, shared metadata VMO and logical block queue,
-and the last completed request sequence to the replacement. The replacement
+and the last completed request sequence through the replacement manager. The
+formal manager keeps NativeBlock and delegates only the existing queue, endpoint
+and shared buffer to the new worker. The replacement
 exports the same queue-owned read-only source window; it does not substitute
 a new queue for the live mount. The manager's client endpoint and shared-buffer
 owner also move; no unmount, remount, namespace replacement or block reactivation
@@ -153,24 +155,34 @@ mount. Protected file mappings retain their backing node and also keep the
 mount busy until the mappings retire. The kernel freezes new admission, synchronizes under the backend mutex, atomically removes
 the mount edge, and invalidates health before allowing late speculative reads.
 Failure keeps the mount edge and thaws admission. On success, the manager tells
-the worker to close its transport/mapping and return its original block owner.
-Read-only mounts also reject mutations at the kernel transport gate, independently
-of worker behavior. No forced/lazy unmount or raw-block reactivation bypass is
-provided. A missing worker leaves the block in the manager so the mount can be
-retried after making the worker available. A running worker failure loses that
-reusable ownership; reopening requires a new backend connection rather than
-assuming interrupted I/O has retired.
+the worker to close its filesystem and acknowledge teardown, waits for process
+resource retirement, then revokes and physically drains its queue. NativeBlock
+stays in the formal manager; a replacement receives a fresh queue only after
+successful retirement. Read-only mounts also reject mutations at the kernel
+transport gate, independently of worker behavior.
+
+`umount --force` only detaches a permanently failed provider by exact mount ID.
+It rejects the namespace root, nested mounts and healthy providers. Dirty VFS
+pages are discarded and counted; metadata or checkpoint loss remains unknown.
+Old references stay failed. Namespace detachment does not prove device quiescence:
+worker and queue retirement remain mandatory. Failure, timeout or a failed device
+keeps the volume unavailable. No lazy unmount or raw-block reactivation bypass is
+provided. A missing worker before delegation leaves the volume retryable.
 
 The formal manager observes worker Process termination independently of its
 serialized mount-control requests. An unexpected exit records the worker name,
 mountpoint, process KOID and kernel terminal reason (including exit status or
-fault class/code). The record goes to the manager's stderr journal stream, and
+fault class/code), volume, generation, stage, loss and recovery status. Worker
+death and recovery are CRITICAL regardless of the parent component policy. The
+component manager provides a direct Console fallback independent of the journal.
+The record also goes to the manager's stderr journal stream, and
 `componentctl status /fs-backend` retains a failure summary. `mount` shows each
 worker's state and terminal reason. The manager stays running for healthy volumes;
 `mount -a` cannot treat a terminated worker as a successful existing mount.
 An explicit clean unmount is distinguished from an unexpected exit. Failed
 mounts remain fenced rather than exposing the directory underneath or silently
-reusing their block connection.
+reusing their block connection. Explicit recovery retains its latest incident in
+`mount` output after the old worker is retired.
 
 Directory enumeration and child metadata are separate operations. A failed
 child mount does not invalidate its parent's directory stream. `ls /` preserves

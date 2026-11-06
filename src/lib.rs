@@ -16,6 +16,15 @@ use hyper_os::{
 mod writeback;
 pub use writeback::WritebackPolicy;
 
+/// Backend operations run in request order. Io/Closed/Corrupt are terminal
+/// protocol errors; ordinary path, capacity and unsupported-operation errors
+/// affect the request. Sync failures are sticky in the service's writeback owner.
+/// Successful writes report accepted prefixes, not durability. Shared window
+/// borrows must retire all uses before returning, including error paths.
+///
+/// After `serve`/`resume` returns, the adapter still owns media teardown: close
+/// its filesystem, drain/retire block work, then acknowledge shutdown or transfer
+/// the handoff transport. A lost parent is not permission to reuse the medium.
 pub trait Volume {
     /// Stable optional operations for this provider instance. A supported
     /// operation may still reject a particular path or range.
@@ -23,12 +32,16 @@ pub trait Volume {
         protocol::Capabilities::NONE
     }
 
+    /// Captured once before READY/RESUMED; it is immutable for this serving
+    /// instance. Restored VFS ownership requires a periodic policy.
     fn writeback_policy(&self) -> WritebackPolicy {
         WritebackPolicy::Synchronous
     }
 
     /// Opt in only when writes retire bounded data-page staging before reply.
     /// Metadata/checkpoint ownership remains in the backend; VFS owns cadence.
+    /// Failure must preserve the prior owner or return a terminal error. Do not
+    /// publish a partial ownership change before returning an error.
     fn enable_vfs_writeback(&mut self) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
@@ -107,8 +120,8 @@ pub trait Volume {
     ) -> Result<(), Error>;
 }
 
-/// A drained worker either returns a block after unmount, or transfers the
-/// still-mounted transport. Both outcomes retain exclusive media ownership.
+/// A drained worker either acknowledges unmount, or transfers the still-mounted
+/// transport. The manager retains exclusive NativeBlock ownership throughout.
 pub enum WorkerReturn {
     Stopped(hyper_os::capability_channel::CapabilityChannel),
     Handoff(Transport),
@@ -176,8 +189,7 @@ fn serve_payload(
     volume: &mut impl Volume,
     payload: PayloadTransport,
 ) -> Result<WorkerReturn, String> {
-    // Reject an invalid backend policy before publishing its transport.
-    writeback::State::new(volume.writeback_policy(), 0).map_err(show)?;
+    let runtime = PreparedRuntime::new(volume, false, now()?)?;
     use hyper_os::{
         capability_channel::{CapabilityChannel, CapabilityDisposition},
         handle::RightsOffer,
@@ -241,10 +253,42 @@ fn serve_payload(
             vfs_writeback: false,
         },
         volume,
+        runtime,
     )
 }
 
-fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerReturn, String> {
+struct PreparedRuntime {
+    bytes: Vec<u8>,
+    writeback: writeback::State,
+}
+
+impl PreparedRuntime {
+    fn new(volume: &mut impl Volume, delegated: bool, now: u64) -> Result<Self, String> {
+        let policy = volume.writeback_policy();
+        policy.validate()?;
+        let mut writeback = writeback::State::new(policy, now).map_err(show)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(protocol::REQUEST_BYTES)
+            .map_err(show)?;
+        bytes.resize(protocol::REQUEST_BYTES, 0);
+        if delegated {
+            if !matches!(policy, WritebackPolicy::Periodic(_)) {
+                return Err("adopted backend lost VFS writeback support".into());
+            }
+            writeback
+                .take_writeback(|| volume.enable_vfs_writeback())
+                .map_err(show)?;
+        }
+        Ok(Self { bytes, writeback })
+    }
+}
+
+fn serve_transport(
+    state: Transport,
+    volume: &mut impl Volume,
+    runtime: PreparedRuntime,
+) -> Result<WorkerReturn, String> {
     use hyper_service::filesystem;
     let Transport {
         control,
@@ -253,18 +297,14 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
         mut buffer,
         payload,
         mut sequence,
-        mut vfs_writeback,
+        vfs_writeback: _,
     } = state;
-    let mut bytes = vec![0; protocol::REQUEST_BYTES];
+    let PreparedRuntime {
+        mut bytes,
+        mut writeback,
+    } = runtime;
     let mut reply = [0; protocol::RESPONSE_BYTES];
     let trace = hyper_os::channel::RpcTracer::new(server.as_handle_ref());
-    let mut writeback = writeback::State::new(volume.writeback_policy(), now()?).map_err(show)?;
-    if vfs_writeback {
-        volume.enable_vfs_writeback().map_err(show)?;
-        if writeback.take_writeback().map_err(show)? == 0 {
-            return Err("adopted backend lost VFS writeback support".into());
-        }
-    }
     loop {
         if writeback.deadline() != hyper_os::DEADLINE_INFINITE {
             let current = now()?;
@@ -315,7 +355,7 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
                     buffer,
                     payload,
                     sequence,
-                    vfs_writeback,
+                    vfs_writeback: writeback.delegated(),
                 }));
             }
             if &command[..count] != filesystem::WORKER_STOP {
@@ -355,9 +395,6 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
             },
             &mut reply,
         )?;
-        if request.operation == Operation::TakeWriteback && result.is_none() {
-            vfs_writeback = matches!(volume.writeback_policy(), WritebackPolicy::Periodic(_));
-        }
         let sent = server.as_byte_channel().send(&reply);
         trace.server_end(
             context,
@@ -374,58 +411,44 @@ fn serve_transport(state: Transport, volume: &mut impl Volume) -> Result<WorkerR
     }
 }
 
-/// Complete graceful teardown without closing or reactivating the `NativeBlock`.
-pub fn return_block(
-    completion: WorkerReturn,
-    block: hyper_os::block::NativeBlock,
-) -> Result<(), String> {
-    use hyper_os::{capability_channel::CapabilityDisposition, handle::RightsOffer};
-    let mut block = Some(block.into_handle());
+/// Acknowledge teardown after the adapter has drained its own submissions.
+/// The manager retains NativeBlock and independently retires the delegated queue.
+pub fn finish(completion: WorkerReturn) -> Result<(), String> {
     match completion {
-        WorkerReturn::Stopped(control) => {
-            let mut offers = [CapabilityDisposition::move_handle(
-                &mut block,
-                RightsOffer::Exact(hyper_os::block::RIGHTS),
-            )
-            .map_err(show)?];
-            hyper_service::io::send_capabilities(
-                &control,
-                hyper_service::filesystem::WORKER_RETURN,
-                &mut offers,
-                hyper_os::DEADLINE_INFINITE,
-            )
-            .map_err(show)
-        }
+        WorkerReturn::Stopped(control) => hyper_service::io::send_capabilities(
+            &control,
+            hyper_service::filesystem::WORKER_RETURN,
+            &mut [],
+            hyper_os::DEADLINE_INFINITE,
+        )
+        .map_err(show),
         WorkerReturn::Handoff(state) => {
+            use hyper_os::{capability_channel::CapabilityDisposition, handle::RightsOffer};
+            use hyper_service::filesystem;
             let PayloadTransport::Block { window, queue } = state.payload else {
-                return Err("block handoff requires a block-backed transport".into());
+                return Err("handoff requires a block-backed transport".into());
             };
             let mut server = Some(state.server);
             let mut queue = Some(queue.into_handle());
             let mut offers = [
                 CapabilityDisposition::move_handle(
-                    &mut block,
-                    RightsOffer::Exact(hyper_os::block::RIGHTS),
-                )
-                .map_err(show)?,
-                CapabilityDisposition::move_handle(
                     &mut server,
-                    RightsOffer::Exact(hyper_service::filesystem::TRANSPORT_RIGHTS),
+                    RightsOffer::Exact(filesystem::TRANSPORT_RIGHTS),
                 )
                 .map_err(show)?,
                 CapabilityDisposition::duplicate(
                     state.buffer.memory().as_handle_ref(),
-                    RightsOffer::Exact(hyper_service::filesystem::SERVER_BUFFER_RIGHTS),
+                    RightsOffer::Exact(filesystem::SERVER_BUFFER_RIGHTS),
                 )
                 .map_err(show)?,
                 CapabilityDisposition::move_handle(
                     &mut queue,
-                    RightsOffer::Exact(hyper_service::filesystem::QUEUE_RIGHTS),
+                    RightsOffer::Exact(filesystem::QUEUE_RIGHTS),
                 )
                 .map_err(show)?,
             ];
             let mut record = [0; 24];
-            record[..8].copy_from_slice(hyper_service::filesystem::WORKER_STATE);
+            record[..8].copy_from_slice(filesystem::WORKER_STATE);
             record[8..16].copy_from_slice(&state.sequence.to_le_bytes());
             record[16..24].copy_from_slice(&u64::from(state.vfs_writeback).to_le_bytes());
             hyper_service::io::send_capabilities(
@@ -439,8 +462,6 @@ pub fn return_block(
             drop(window);
             drop(state.owner);
             drop(state.control);
-            // Only system init decides when the old process retires. The
-            // successful MOVE has already removed every active transport owner.
             loop {
                 std::thread::park();
             }
@@ -449,13 +470,11 @@ pub fn return_block(
 }
 
 /// Receive the original transport after the manager has loaded this process
-/// resident. No filesystem operations run until exclusive block ownership moves.
-pub fn adopt(
-    startup: &mut Startup<'_>,
-) -> Result<(hyper_os::block::NativeBlock, Transport), String> {
+/// resident. Queue ownership moves only after the previous worker drains it.
+pub fn adopt(startup: &mut Startup<'_>) -> Result<Transport, String> {
     use hyper_os::{
         capability_channel::{CapabilityChannel, CapabilityReceiveSlot},
-        handle::{NativeBlockObject, VmoObject},
+        handle::VmoObject,
     };
     use hyper_service::filesystem;
     let control =
@@ -476,7 +495,6 @@ pub fn adopt(
     .map_err(show)?;
     let mut bytes = [core::mem::MaybeUninit::uninit(); 24];
     let mut slots = [
-        CapabilityReceiveSlot::new::<NativeBlockObject>(hyper_os::block::RIGHTS),
         CapabilityReceiveSlot::new::<ByteChannelObject>(filesystem::TRANSPORT_RIGHTS),
         CapabilityReceiveSlot::new::<VmoObject>(filesystem::SERVER_BUFFER_RIGHTS),
         CapabilityReceiveSlot::new::<BlockQueueObject>(filesystem::QUEUE_RIGHTS),
@@ -486,7 +504,7 @@ pub fn adopt(
         .map_err(show)?;
     if message.bytes().len() != 24
         || &message.bytes()[..8] != filesystem::WORKER_STATE
-        || message.capability_count() != 4
+        || message.capability_count() != 3
     {
         return Err("invalid filesystem adoption record".into());
     }
@@ -497,20 +515,16 @@ pub fn adopt(
         1 => true,
         _ => return Err("invalid filesystem writeback owner".into()),
     };
-    let block = slots[0]
-        .take::<NativeBlockObject>()
-        .map_err(show)?
-        .ok_or("missing adopted block")?;
-    let server = slots[1]
+    let server = slots[0]
         .take::<ByteChannelObject>()
         .map_err(show)?
         .ok_or("missing adopted endpoint")?;
-    let memory = slots[2]
+    let memory = slots[1]
         .take::<VmoObject>()
         .map_err(show)?
         .ok_or("missing adopted shared memory")?;
     let queue = BlockQueue::from_handle(
-        slots[3]
+        slots[2]
             .take::<BlockQueueObject>()
             .map_err(show)?
             .ok_or("missing adopted block queue")?,
@@ -527,21 +541,19 @@ pub fn adopt(
         protocol::DATA_BYTES,
     )
     .map_err(show)?;
-    Ok((
-        hyper_os::block::NativeBlock::from_handle(block),
-        Transport {
-            control,
-            owner,
-            server,
-            buffer,
-            payload: PayloadTransport::Block { window, queue },
-            sequence,
-            vfs_writeback,
-        },
-    ))
+    Ok(Transport {
+        control,
+        owner,
+        server,
+        buffer,
+        payload: PayloadTransport::Block { window, queue },
+        sequence,
+        vfs_writeback,
+    })
 }
 
 pub fn resume(state: Transport, volume: &mut impl Volume) -> Result<WorkerReturn, String> {
+    let runtime = PreparedRuntime::new(volume, state.vfs_writeback, now()?)?;
     hyper_service::io::send_capabilities(
         &state.control,
         hyper_service::filesystem::WORKER_RESUMED,
@@ -549,7 +561,7 @@ pub fn resume(state: Transport, volume: &mut impl Volume) -> Result<WorkerReturn
         hyper_os::DEADLINE_INFINITE,
     )
     .map_err(show)?;
-    serve_transport(state, volume)
+    serve_transport(state, volume, runtime)
 }
 
 fn now() -> Result<u64, String> {
@@ -668,10 +680,7 @@ fn dispatch(
                 {
                     return Err(Error::InvalidInput);
                 }
-                if matches!(volume.writeback_policy(), WritebackPolicy::Periodic(_)) {
-                    volume.enable_vfs_writeback()?;
-                }
-                writeback.take_writeback()
+                writeback.take_writeback(|| volume.enable_vfs_writeback())
             }
             Operation::Sync => volume.sync().map(|_| 0),
             Operation::SyncFile => {
