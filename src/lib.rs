@@ -14,7 +14,7 @@ use hyper_os::{
 };
 
 mod writeback;
-pub use writeback::WritebackPolicy;
+pub use writeback::{SubmittedWrite, WriteCompletion, WritebackPolicy};
 
 /// Backend operations run in request order. Io/Closed/Corrupt are terminal
 /// protocol errors; ordinary path, capacity and unsupported-operation errors
@@ -38,7 +38,8 @@ pub trait Volume {
         WritebackPolicy::Synchronous
     }
 
-    /// Opt in only when writes retire bounded data-page staging before reply.
+    /// Opt in only when ordinary writes retire bounded data-page staging before reply.
+    /// Separately negotiated `SubmitWriteback` uses owned completion receipts.
     /// Metadata/checkpoint ownership remains in the backend; VFS owns cadence.
     /// Failure must preserve the prior owner or return a terminal error. Do not
     /// publish a partial ownership change before returning an error.
@@ -90,6 +91,22 @@ pub trait Volume {
         self.write(path, offset, input)
     }
 
+    /// Consume a bounded input prefix and return its independently progressing
+    /// completion. Requires `ASYNC_WRITEBACK` plus delegated periodic ownership.
+    /// Reserve receipt/staging/completion resources before mutation. Returning an
+    /// error means no accepted receipt: reject before mutation, or return a terminal
+    /// error if progress is unknown. After partial mutation return an accepted
+    /// prefix and a receipt carrying any late failure. No input borrow may escape.
+    fn submit_writeback(
+        &mut self,
+        _path: &str,
+        _offset: u64,
+        _input: &[u8],
+        _token: u64,
+    ) -> Result<SubmittedWrite, Error> {
+        Err(Error::Unsupported)
+    }
+
     fn create(&mut self, path: &str, directory: bool) -> Result<(), Error>;
 
     fn remove(&mut self, path: &str) -> Result<(), Error>;
@@ -121,7 +138,7 @@ pub trait Volume {
 }
 
 /// A drained worker either acknowledges unmount, or transfers the still-mounted
-/// transport. The manager retains exclusive NativeBlock ownership throughout.
+/// transport. The manager retains exclusive `NativeBlock` ownership throughout.
 pub enum WorkerReturn {
     Stopped(hyper_os::capability_channel::CapabilityChannel),
     Handoff(Transport),
@@ -405,14 +422,16 @@ fn serve_transport(
             },
         );
         sent.map_err(show)?;
-        if result.is_some_and(Error::terminal) {
+        if result.is_some_and(Error::terminal)
+            || (request.operation == Operation::ReapWriteback && writeback.failed())
+        {
             return Err("filesystem backend failed".into());
         }
     }
 }
 
 /// Acknowledge teardown after the adapter has drained its own submissions.
-/// The manager retains NativeBlock and independently retires the delegated queue.
+/// The manager retains `NativeBlock` and independently retires the delegated queue.
 pub fn finish(completion: WorkerReturn) -> Result<(), String> {
     match completion {
         WorkerReturn::Stopped(control) => hyper_service::io::send_capabilities(
@@ -663,6 +682,52 @@ fn dispatch(
                 }
                 .map(|n| n as u64)
             }
+            Operation::SubmitWriteback => {
+                if !volume.capabilities().supports_async_writeback() {
+                    return Err(Error::Unsupported);
+                }
+                if !request.target.is_empty()
+                    || request.accessed.is_some()
+                    || request.modified.is_some()
+                {
+                    return Err(Error::InvalidInput);
+                }
+                let length = usize::try_from(request.length).map_err(|_| Error::InvalidInput)?;
+                let input = match (window, request.window_token) {
+                    (None, 0) => data.get(..length),
+                    (Some(window), token) if token != 0 => window.get(..length),
+                    _ => return Err(Error::InvalidInput),
+                }
+                .ok_or(Error::InvalidInput)?;
+                writeback.submit(request.sequence, length, || {
+                    volume.submit_writeback(
+                        request.path,
+                        request.offset,
+                        input,
+                        request.window_token,
+                    )
+                })
+            }
+            Operation::ReapWriteback => {
+                if !volume.capabilities().supports_async_writeback() || !writeback.delegated() {
+                    return Err(Error::Unsupported);
+                }
+                if !request.path.is_empty()
+                    || !request.target.is_empty()
+                    || request.length != 0
+                    || request.accessed.is_some()
+                    || request.modified.is_some()
+                {
+                    return Err(Error::InvalidInput);
+                }
+                // Validate output capacity before consuming the exact receipt.
+                let output = data
+                    .get_mut(..protocol::WRITEBACK_COMPLETION_BYTES)
+                    .ok_or(Error::InvalidInput)?;
+                let completed = writeback.reap(request.offset)?;
+                completed.encode(output).ok_or(Error::Corrupt)?;
+                Ok(protocol::WRITEBACK_COMPLETION_BYTES as u64)
+            }
             Operation::Create if request.length <= 1 => {
                 volume.create(request.path, request.length != 0).map(|_| 0)
             }
@@ -700,7 +765,14 @@ fn dispatch(
         });
     let result = writeback.complete(request.operation, result, || volume.sync());
 
-    let failure = result.err();
+    let failure = result.err().or_else(|| {
+        if request.operation == Operation::ReapWriteback && result.is_ok() {
+            protocol::WritebackCompletion::decode(&data[..protocol::WRITEBACK_COMPLETION_BYTES])
+                .and_then(|completed| completed.result.err())
+        } else {
+            None
+        }
+    });
     Response {
         sequence: request.sequence,
         operation: request.operation,

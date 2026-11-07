@@ -14,14 +14,24 @@ struct Backend {
     policy: Option<WritebackPolicy>,
     policy_queries: std::cell::Cell<usize>,
     enables: usize,
+    async_writeback: bool,
+    accepted: Option<usize>,
+    completion_error: Option<Error>,
+    completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Volume for Backend {
     fn capabilities(&self) -> protocol::Capabilities {
-        if self.read_extents {
-            protocol::Capabilities::READ_EXTENTS
-        } else {
-            protocol::Capabilities::NONE
-        }
+        protocol::Capabilities::from_bits(
+            if self.read_extents {
+                protocol::Capabilities::READ_EXTENTS.bits()
+            } else {
+                0
+            } | if self.async_writeback {
+                protocol::Capabilities::ASYNC_WRITEBACK.bits()
+            } else {
+                0
+            },
+        )
     }
     fn writeback_policy(&self) -> WritebackPolicy {
         self.policy_queries.set(self.policy_queries.get() + 1);
@@ -60,6 +70,23 @@ impl Volume for Backend {
     fn write(&mut self, _: &str, _: u64, input: &[u8]) -> Result<usize, Error> {
         self.mutations += 1;
         Ok(input.len())
+    }
+    fn submit_writeback(
+        &mut self,
+        _: &str,
+        _: u64,
+        input: &[u8],
+        _: u64,
+    ) -> Result<SubmittedWrite, Error> {
+        let completion = Box::new(TestCompletion(
+            self.completed.clone(),
+            self.completion_error,
+        ));
+        self.mutations += 1;
+        Ok(SubmittedWrite {
+            accepted: self.accepted.unwrap_or(input.len()),
+            completion,
+        })
     }
     fn create(&mut self, _: &str, _: bool) -> Result<(), Error> {
         self.mutations += 1;
@@ -444,5 +471,179 @@ fn malformed_negotiation_has_no_backend_side_effects() -> Result<(), String> {
     );
     assert_eq!(backend.enables, 0);
     assert_eq!(runtime.writeback.deadline(), 30_000_000_000);
+    Ok(())
+}
+
+struct TestCompletion(
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    Option<Error>,
+);
+impl WriteCompletion for TestCompletion {
+    fn wait(self: Box<Self>) -> Result<(), Error> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.1.map_or(Ok(()), Err)
+    }
+}
+
+type AsyncReply = (
+    Result<u64, Error>,
+    [u8; protocol::WRITEBACK_COMPLETION_BYTES],
+    Option<Error>,
+);
+
+fn async_invoke(
+    backend: &mut Backend,
+    state: &mut writeback::State,
+    request: Request<'_>,
+) -> Result<AsyncReply, String> {
+    let mut reply = [0; protocol::RESPONSE_BYTES];
+    let mut data = [0; protocol::WRITEBACK_COMPLETION_BYTES];
+    let failure = dispatch(backend, state, request, &mut data, None, &mut reply)?;
+    let decoded = protocol::ResponseRef::decode(&reply, request.sequence, request.operation)
+        .ok_or("bad async reply")?;
+    Ok((decoded.result(), data, failure))
+}
+
+#[test]
+fn async_requires_separate_capability_and_delegation_and_keeps_readonly_guard() -> Result<(), String>
+{
+    let submit = Request {
+        sequence: 4,
+        length: 4,
+        ..request(Operation::SubmitWriteback)
+    };
+    let mut backend = Backend {
+        periodic: true,
+        ..Backend::default()
+    };
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    assert_eq!(
+        async_invoke(&mut backend, &mut state, submit)?.0,
+        Err(Error::Unsupported)
+    );
+    backend.async_writeback = true;
+    assert_eq!(
+        async_invoke(&mut backend, &mut state, submit)?.0,
+        Err(Error::Unsupported)
+    );
+    assert_eq!(backend.mutations, 0);
+    invoke(&mut backend, &mut state, Operation::TakeWriteback)?.map_err(show)?;
+    assert_eq!(async_invoke(&mut backend, &mut state, submit)?.0, Ok(4));
+    assert_eq!(backend.mutations, 1);
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Sync)?,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(backend.fences, 0);
+    let mut readonly = writeback::State::new(WritebackPolicy::ReadOnly, 0).map_err(show)?;
+    assert_eq!(
+        async_invoke(&mut backend, &mut readonly, submit)?.0,
+        Err(Error::ReadOnly)
+    );
+    assert_eq!(backend.mutations, 1);
+    Ok(())
+}
+
+#[test]
+fn async_completion_returns_prefix_and_error_without_promising_rollback() -> Result<(), String> {
+    let mut backend = Backend {
+        periodic: true,
+        async_writeback: true,
+        accepted: Some(3),
+        completion_error: Some(Error::Io),
+        ..Backend::default()
+    };
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    invoke(&mut backend, &mut state, Operation::TakeWriteback)?.map_err(show)?;
+    let submit = Request {
+        sequence: 4,
+        length: 4,
+        ..request(Operation::SubmitWriteback)
+    };
+    assert_eq!(async_invoke(&mut backend, &mut state, submit)?.0, Ok(3));
+    let reap = Request {
+        sequence: 5,
+        offset: 4,
+        path: "",
+        ..request(Operation::ReapWriteback)
+    };
+    let (result, data, failure) = async_invoke(&mut backend, &mut state, reap)?;
+    assert_eq!(result, Ok(protocol::WRITEBACK_COMPLETION_BYTES as u64));
+    assert_eq!(failure, Some(Error::Io));
+    assert_eq!(
+        protocol::WritebackCompletion::decode(&data),
+        Some(protocol::WritebackCompletion {
+            batch: 4,
+            accepted: 3,
+            result: Err(Error::Io),
+        })
+    );
+    assert_eq!(
+        invoke(&mut backend, &mut state, Operation::Sync)?,
+        Err(Error::Io)
+    );
+    assert_eq!(
+        backend.completed.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_async_requests_do_not_consume_or_mutate_backend() -> Result<(), String> {
+    let mut backend = Backend {
+        periodic: true,
+        async_writeback: true,
+        ..Backend::default()
+    };
+    let mut state = writeback::State::new(backend.writeback_policy(), 0).map_err(show)?;
+    invoke(&mut backend, &mut state, Operation::TakeWriteback)?.map_err(show)?;
+    let submit = Request {
+        sequence: 4,
+        length: 4,
+        target: "unexpected",
+        ..request(Operation::SubmitWriteback)
+    };
+    assert_eq!(
+        async_invoke(&mut backend, &mut state, submit)?.0,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(backend.mutations, 0);
+    let submit = Request {
+        target: "",
+        ..submit
+    };
+    assert_eq!(async_invoke(&mut backend, &mut state, submit)?.0, Ok(4));
+    let reap = Request {
+        sequence: 5,
+        offset: 4,
+        ..request(Operation::ReapWriteback)
+    };
+    assert_eq!(
+        async_invoke(&mut backend, &mut state, reap)?.0,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        backend.completed.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(!state.failed());
+    let reap = Request { path: "", ..reap };
+    assert_eq!(
+        async_invoke(&mut backend, &mut state, reap)?.0,
+        Ok(protocol::WRITEBACK_COMPLETION_BYTES as u64)
+    );
+    assert_eq!(
+        async_invoke(
+            &mut backend,
+            &mut state,
+            Request {
+                sequence: 6,
+                ..reap
+            }
+        )?
+        .0,
+        Err(Error::Corrupt)
+    );
     Ok(())
 }
