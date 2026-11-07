@@ -27,8 +27,8 @@ a late fence error is latched and subsequent requests/sync report failure.
 `Periodic(Duration)` is reserved for recoverable backends. Before negotiation,
 the ordered request loop performs idle/busy periodic sync; `periodic_sync` may
 skip clean work. A backend may implement `enable_vfs_writeback` to accept the
-`TakeWriteback` mount request. It must retire bounded data staging before write
-replies. The reply supplies the interval and disables the service timer: VFS now
+`TakeWriteback` mount request. Ordinary `Write` still retires bounded data staging
+before its reply; asynchronous acceptance uses a separately negotiated operation. The reply supplies the interval and disables the service timer: VFS now
 owns dirty file pages, pressure submission, and data-before-checkpoint ordering.
 `Sync` requests the full volume fence. `SyncFile` names one path and encodes
 `SyncMode` in `length` (0 for data and recovery metadata, 1 for all file metadata);
@@ -48,6 +48,48 @@ Periodic success includes the backend's device-reported completion, not physical
 readback verification. The interval is a scheduling cadence, not a hard maximum
 persistence latency. Failure never advances the deadline, and stopping or handing
 off the service cannot leave a detached synchronization thread.
+
+## Bounded asynchronous writeback
+
+`Capabilities::ASYNC_WRITEBACK` is independent of periodic synchronization policy.
+A provider must advertise this capability and successfully delegate periodic
+writeback before accepting `SubmitWriteback`. FAT and other nonparticipants keep
+ordinary synchronous `Write` behavior; callers must not infer support from a
+filesystem name or a nonzero interval.
+
+`SubmitWriteback` uses the existing write fields and input window. The backend
+reserves its receipt, staging and completion resources before mutation, consumes
+all borrowed input before replying, and returns the accepted byte prefix. Its
+request sequence identifies the batch within this transport generation. The
+service retains at most two receipts, each covering at most 512 KiB. A rejected
+capacity admission invokes no backend mutation. After partial mutation, return
+an accepted prefix with a receipt carrying any late error; ambiguous progress
+requires a terminal failure, never an automatic retry.
+
+`ReapWriteback` names the oldest pending submission sequence in `offset`; all
+other payload fields are empty. Its successful reply publishes a 24-byte
+`WritebackCompletion` in shared data: batch ID, accepted byte count and outcome.
+The byte count repeats accepted input, not a measured physical completion prefix.
+Success means all accepted data writeback completed; failure may have partial
+device effects. Neither outcome is a checkpoint or durability fence. Zero,
+unknown, out-of-order and duplicate batch IDs are corrupt protocol transactions.
+The endpoint and its monotonic sequence bind identity; a lost acceptance reply
+retires the session rather than guessing whether to resubmit.
+
+Physical completion must progress without calling `WriteCompletion::wait` and
+without the mutable request actor, VFS state lock or caller's file-content lock.
+This lets the actor wait for an older same-page writeback or reap a receipt without
+blocking the worker that clears page writeback state. Dropped receipts must retire
+safely or transfer to a completion owner joined before backend teardown. The
+current ordered transport needs no unsolicited completion frames or extra input
+windows: acceptance releases the input window, while VFS retains exact dirty
+versions until their corresponding completion is collected.
+
+Before any ordinary metadata, read, sync or structural operation, the client
+reaps pending receipts. These conservative fences preserve the sequential Volume
+contract; cache-only VFS activity may continue independently. Any completion
+failure is sticky and closes serving after the completion reply. Teardown still
+requires physical queue retirement before the manager reuses the medium.
 
 ## Build and test
 

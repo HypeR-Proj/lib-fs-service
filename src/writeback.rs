@@ -5,6 +5,9 @@
 use hyper_filesystem::protocol::{self, Error, Operation};
 use std::time::Duration;
 
+mod pending;
+pub use pending::{SubmittedWrite, WriteCompletion};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WritebackPolicy {
     /// Each mutation completes filesystem synchronization before replying.
@@ -48,6 +51,7 @@ pub(crate) fn mutation(operation: Operation) -> bool {
     matches!(
         operation,
         Operation::Write
+            | Operation::SubmitWriteback
             | Operation::Create
             | Operation::Remove
             | Operation::Rename
@@ -62,6 +66,7 @@ pub(crate) struct State {
     deadline: u64,
     failure: Option<Error>,
     delegated: bool,
+    pending: pending::Pending,
 }
 
 impl State {
@@ -72,6 +77,7 @@ impl State {
             interval,
             failure: None,
             delegated: false,
+            pending: pending::Pending::new(),
             deadline: interval.map_or(u64::MAX, |n| now.saturating_add(n).min(u64::MAX - 1)),
         })
     }
@@ -93,6 +99,10 @@ impl State {
         Ok(interval)
     }
 
+    pub(crate) fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
+
     pub(crate) fn delegated(&self) -> bool {
         self.delegated
     }
@@ -101,9 +111,39 @@ impl State {
         self.deadline
     }
 
+    pub(crate) fn submit(
+        &mut self,
+        batch: u64,
+        requested: usize,
+        submit: impl FnOnce() -> Result<SubmittedWrite, Error>,
+    ) -> Result<u64, Error> {
+        if !self.delegated {
+            return Err(Error::Unsupported);
+        }
+        self.pending.submit(batch, requested, submit)
+    }
+
+    pub(crate) fn reap(&mut self, batch: u64) -> Result<protocol::WritebackCompletion, Error> {
+        let completed = self.pending.reap(batch)?;
+        if let Err(error) = completed.result {
+            self.failure = Some(error);
+        }
+        Ok(completed)
+    }
+
     pub(crate) fn admit(&self, operation: Operation) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
+        }
+        if !self.pending.is_empty()
+            && !matches!(
+                operation,
+                Operation::SubmitWriteback | Operation::ReapWriteback | Operation::Capabilities
+            )
+        {
+            // The client must retire all accepted batches before using an ordinary
+            // filesystem operation as a metadata, read or durability fence.
+            return Err(Error::InvalidInput);
         }
         if self.policy == WritebackPolicy::ReadOnly && mutation(operation) {
             return Err(Error::ReadOnly);
